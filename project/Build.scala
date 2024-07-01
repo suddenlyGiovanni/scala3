@@ -118,9 +118,9 @@ object Build {
   val mimaPreviousLTSDottyVersion = "3.3.0"
 
   /** Version of Scala CLI to download */
-  val scalaCliLauncherVersion = "1.3.2"
+  val scalaCliLauncherVersion = "1.4.0"
   /** Version of Scala CLI to download (on Windows - last known validated version) */
-  val scalaCliLauncherVersionWindows = "1.3.2"
+  val scalaCliLauncherVersionWindows = "1.4.0"
   /** Version of Coursier to download for initializing the local maven repo of Scala command */
   val coursierJarVersion = "2.1.10"
 
@@ -1351,12 +1351,15 @@ object Build {
       BuildInfoPlugin.buildInfoDefaultSettings
 
   def presentationCompilerSettings(implicit mode: Mode) = {
-    val mtagsVersion = "1.3.1"
+    val mtagsVersion = "1.3.2"
     Seq(
       libraryDependencies ++= Seq(
         "org.lz4" % "lz4-java" % "1.8.0",
         "io.get-coursier" % "interface" % "1.0.18",
-        "org.scalameta" % "mtags-interfaces" % mtagsVersion,
+        ("org.scalameta" % "mtags-interfaces" % mtagsVersion)
+          .exclude("org.eclipse.lsp4j","org.eclipse.lsp4j")
+          .exclude("org.eclipse.lsp4j","org.eclipse.lsp4j.jsonrpc"),
+        "org.eclipse.lsp4j" % "org.eclipse.lsp4j" % "0.20.1",
       ),
       libraryDependencies += ("org.scalameta" % "mtags-shared_2.13.12" % mtagsVersion % SourceDeps),
       ivyConfigurations += SourceDeps.hide,
@@ -2127,7 +2130,14 @@ object Build {
     republishRepo := target.value / "republish",
     packResourceDir += (republishRepo.value / "bin" -> "bin"),
     packResourceDir += (republishRepo.value / "maven2" -> "maven2"),
-    Compile / pack := (Compile / pack).dependsOn(republish).value,
+    packResourceDir += (republishRepo.value / "etc" -> "etc"),
+    republishCommandLibs +=
+      ("scala" -> List("scala3-interfaces", "scala3-compiler", "scala3-library", "tasty-core")),
+    republishCommandLibs +=
+      ("with_compiler" -> List("scala3-staging", "scala3-tasty-inspector", "^!scala3-interfaces", "^!scala3-compiler", "^!scala3-library", "^!tasty-core")),
+    republishCommandLibs +=
+      ("scaladoc" -> List("scala3-interfaces", "scala3-compiler", "scala3-library", "tasty-core", "scala3-tasty-inspector", "scaladoc")),
+    Compile / pack := republishPack.value,
   )
 
   lazy val dist = project.asDist(Bootstrapped)
@@ -2167,7 +2177,7 @@ object Build {
       republishBinOverrides += (dist / baseDirectory).value / "bin-native-overrides",
       republishFetchCoursier := (dist / republishFetchCoursier).value,
       republishExtraProps += ("cli_version" -> scalaCliLauncherVersion),
-      mappings += (republishRepo.value / "etc" / "EXTRA_PROPERTIES" -> "EXTRA_PROPERTIES"),
+      mappings += (republishRepo.value / "EXTRA_PROPERTIES" -> "EXTRA_PROPERTIES"),
       republishLaunchers +=
         ("scala-cli.exe" -> s"zip+https://github.com/VirtusLab/scala-cli/releases/download/v$scalaCliLauncherVersionWindows/scala-cli-x86_64-pc-win32.zip!/scala-cli.exe")
     )
