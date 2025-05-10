@@ -52,6 +52,7 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
     tree
 
   override def transformIdent(tree: Ident)(using Context): tree.type =
+    refInfos.isAssignment = tree.hasAttachment(AssignmentTarget)
     if tree.symbol.exists then
       // if in an inline expansion, resolve at summonInline (synthetic pos) or in an enclosing call site
       val resolving =
@@ -68,10 +69,12 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
         resolveUsage(tree.symbol, tree.name, tree.typeOpt.importPrefix.skipPackageObject)
     else if tree.hasType then
       resolveUsage(tree.tpe.classSymbol, tree.name, tree.tpe.importPrefix.skipPackageObject)
+    refInfos.isAssignment = false
     tree
 
   // import x.y; y may be rewritten x.y, also import x.z as y
   override def transformSelect(tree: Select)(using Context): tree.type =
+    refInfos.isAssignment = tree.hasAttachment(AssignmentTarget)
     val name = tree.removeAttachment(OriginalName).getOrElse(nme.NO_NAME)
     inline def isImportable = tree.qualifier.srcPos.isSynthetic
       && tree.qualifier.tpe.match
@@ -92,6 +95,7 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
         resolveUsage(tree.symbol, name, tree.qualifier.tpe)
     else if !ignoreTree(tree) then
       refUsage(tree.symbol)
+    refInfos.isAssignment = false
     tree
 
   override def transformLiteral(tree: Literal)(using Context): tree.type =
@@ -113,13 +117,10 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
     ctx
 
   override def prepareForAssign(tree: Assign)(using Context): Context =
-    tree.lhs.putAttachment(Ignore, ()) // don't take LHS reference as a read
+    tree.lhs.putAttachment(AssignmentTarget, ()) // don't take LHS reference as a read
     ctx
   override def transformAssign(tree: Assign)(using Context): tree.type =
-    tree.lhs.removeAttachment(Ignore)
-    val sym = tree.lhs.symbol
-    if sym.exists then
-      refInfos.asss.addOne(sym)
+    tree.lhs.removeAttachment(AssignmentTarget)
     tree
 
   override def prepareForMatch(tree: Match)(using Context): Context =
@@ -215,15 +216,6 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
       refInfos.register(tree)
     tree
 
-  override def prepareForTemplate(tree: Template)(using Context): Context =
-    ctx.fresh.setProperty(resolvedKey, Resolved())
-
-  override def prepareForPackageDef(tree: PackageDef)(using Context): Context =
-    ctx.fresh.setProperty(resolvedKey, Resolved())
-
-  override def prepareForStats(trees: List[Tree])(using Context): Context =
-    ctx.fresh.setProperty(resolvedKey, Resolved())
-
   override def transformOther(tree: Tree)(using Context): tree.type =
     tree match
     case imp: Import =>
@@ -289,7 +281,6 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
     case ByNameTypeTree(result) =>
       transformAllDeep(result)
     //case _: InferredTypeTree => // do nothing
-    //case _: Export => // nothing to do
     //case _ if tree.isType =>
     case _ =>
     tree
@@ -301,7 +292,7 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
   // if sym is not an enclosing element, record the reference
   def refUsage(sym: Symbol)(using Context): Unit =
     if !ctx.outersIterator.exists(cur => cur.owner eq sym) then
-      refInfos.refs.addOne(sym)
+      refInfos.addRef(sym)
 
   /** Look up a reference in enclosing contexts to determine whether it was introduced by a definition or import.
    *  The binding of highest precedence must then be correct.
@@ -350,29 +341,18 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
       && ctxsym.thisType.baseClasses.contains(sym.owner)
       && ctxsym.thisType.member(sym.name).hasAltWith(d => d.containsSym(sym) && !name.exists(_ != d.name))
 
-    // Attempt to cache a result at the given context. Not all contexts bear a cache, including NoContext.
-    // If there is already any result for the name and prefix, do nothing.
-    def addCached(where: Context, result: Precedence): Unit =
-      if where.moreProperties ne null then
-        where.property(resolvedKey) match
-        case Some(resolved) =>
-          resolved.record(sym, name, prefix, result)
-        case none =>
-
     // Avoid spurious NoSymbol and also primary ctors which are never warned about.
-    // Selections C.this.toString should be already excluded, but backtopped here for eq, etc.
+    // Selections C.this.toString should be already excluded, but backstopped here for eq, etc.
     if !sym.exists || sym.isPrimaryConstructor || sym.isEffectiveRoot || defn.topClasses(sym.owner) then return
 
     // Find the innermost, highest precedence. Contexts have no nesting levels but assume correctness.
     // If the sym is an enclosing definition (the owner of a context), it does not count toward usages.
     val isLocal = sym.isLocalToBlock
     var candidate: Context = NoContext
-    var cachePoint: Context = NoContext // last context with Resolved cache
     var importer: ImportSelector | Null = null // non-null for import context
     var precedence = NoPrecedence // of current resolution
     var enclosed = false // true if sym is owner of an enclosing context
     var done = false
-    var cached = false
     val ctxs = ctx.outersIterator
     while !done && ctxs.hasNext do
       val cur = ctxs.next()
@@ -382,24 +362,7 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
         if cur.owner eq sym.owner then
           done = true // for local def, just checking that it is not enclosing
       else
-        val cachedPrecedence =
-          cur.property(resolvedKey) match
-          case Some(resolved) =>
-            // conservative, cache must be nested below the result context
-            if precedence.isNone then
-              cachePoint = cur // no result yet, and future result could be cached here
-            resolved.hasRecord(sym, name, prefix)
-          case none => NoPrecedence
-        cached = !cachedPrecedence.isNone
-        if cached then
-          // if prefer cached precedence, then discard previous result
-          if precedence.weakerThan(cachedPrecedence) then
-            candidate = NoContext
-            importer = null
-            cachePoint = cur // actual cache context
-            precedence = cachedPrecedence // actual cached precedence
-          done = true
-        else if cur.isImportContext then
+        if cur.isImportContext then
           val sel = matchingSelector(cur.importInfo.nn)
           if sel != null then
             if cur.importInfo.nn.isRootImport then
@@ -430,16 +393,9 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
     end while
     // record usage and possibly an import
     if !enclosed then
-      refInfos.refs.addOne(sym)
+      refInfos.addRef(sym)
     if candidate != NoContext && candidate.isImportContext && importer != null then
       refInfos.sels.put(importer, ())
-    // possibly record that we have performed this look-up
-    // if no result was found, take it as Definition (local or rooted head of fully qualified path)
-    val adjusted = if precedence.isNone then Definition else precedence
-    if !cached && (cachePoint ne NoContext) then
-      addCached(cachePoint, adjusted)
-    if cachePoint ne ctx then
-      addCached(ctx, adjusted) // at this ctx, since cachePoint may be far up the outer chain
   end resolveUsage
 end CheckUnused
 
@@ -451,14 +407,7 @@ object CheckUnused:
 
   val refInfosKey = Property.StickyKey[RefInfos]
 
-  val resolvedKey = Property.Key[Resolved]
-
   inline def refInfos(using Context): RefInfos = ctx.property(refInfosKey).get
-
-  inline def resolved(using Context): Resolved =
-    ctx.property(resolvedKey) match
-    case Some(res) => res
-    case _ => throw new MatchError("no Resolved for context")
 
   /** Attachment holding the name of an Ident as written by the user. */
   val OriginalName = Property.StickyKey[Name]
@@ -468,6 +417,9 @@ object CheckUnused:
 
   /** Ignore reference. */
   val Ignore = Property.StickyKey[Unit]
+
+  /** Tree is LHS of Assign. */
+  val AssignmentTarget = Property.StickyKey[Unit]
 
   class PostTyper extends CheckUnused(PhaseMode.Aggregate, "PostTyper")
 
@@ -488,7 +440,7 @@ object CheckUnused:
         if inliners == 0
           && languageImport(imp.expr).isEmpty
           && !imp.isGeneratedByEnum
-          && !ctx.outer.owner.name.isReplWrapperName
+          && !ctx.owner.name.isReplWrapperName
         then
           imps.put(imp, ())
       case tree: Bind =>
@@ -513,25 +465,15 @@ object CheckUnused:
 
     val inlined = Stack.empty[SrcPos] // enclosing call.srcPos of inlined code (expansions)
     var inliners = 0 // depth of inline def (not inlined yet)
-  end RefInfos
 
-  // Symbols already resolved in the given Context (with name and prefix of lookup).
-  class Resolved:
-    import PrecedenceLevels.*
-    private val seen = mutable.Map.empty[Symbol, List[(Name, Type, Precedence)]].withDefaultValue(Nil)
-    // if a result has been recorded, return it; otherwise, NoPrecedence.
-    def hasRecord(symbol: Symbol, name: Name, prefix: Type)(using Context): Precedence =
-      seen(symbol).find((n, p, _) => n == name && p =:= prefix) match
-      case Some((_, _, r)) => r
-      case none => NoPrecedence
-    // "record" the look-up result, if there is not already a result for the name and prefix.
-    def record(symbol: Symbol, name: Name, prefix: Type, result: Precedence)(using Context): Unit =
-      require(NoPrecedence.weakerThan(result))
-      seen.updateWith(symbol):
-        case svs @ Some(vs) =>
-          if vs.exists((n, p, _) => n == name && p =:= prefix) then svs
-          else Some((name, prefix, result) :: vs)
-        case none => Some((name, prefix, result) :: Nil)
+    // instead of refs.addOne, use addRef to distinguish a read from a write to var
+    var isAssignment = false
+    def addRef(sym: Symbol): Unit =
+      if isAssignment then
+        asss.addOne(sym)
+      else
+        refs.addOne(sym)
+  end RefInfos
 
   // Names are resolved by definitions and imports, which have four precedence levels:
   object PrecedenceLevels:
