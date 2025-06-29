@@ -1719,7 +1719,7 @@ object desugar {
    */
   def tuple(tree: Tuple, pt: Type)(using Context): Tree =
     var elems = checkWellFormedTupleElems(tree.trees)
-    if ctx.mode.is(Mode.Pattern) then elems = adaptPatternArgs(elems, pt)
+    if ctx.mode.is(Mode.Pattern) then elems = adaptPatternArgs(elems, pt, tree.srcPos)
     val elemValues = elems.mapConserve(stripNamedArg)
     val tup =
       val arity = elems.length
@@ -1759,25 +1759,31 @@ object desugar {
    *   - If `elems` are named pattern elements, rearrange them to match `pt`.
    *     This requires all names in `elems` to be also present in `pt`.
    */
-  def adaptPatternArgs(elems: List[Tree], pt: Type)(using Context): List[Tree] =
+  def adaptPatternArgs(elems: List[Tree], pt: Type, pos: SrcPos)(using Context): List[Tree] =
 
     def reorderedNamedArgs(wildcardSpan: Span): List[untpd.Tree] =
-      var selNames = pt.namedTupleElementTypes(false).map(_(0))
-      if selNames.isEmpty && pt.classSymbol.is(CaseClass) then
-        selNames = pt.classSymbol.caseAccessors.map(_.name.asTermName)
-      val nameToIdx = selNames.zipWithIndex.toMap
-      val reordered = Array.fill[untpd.Tree](selNames.length):
-        untpd.Ident(nme.WILDCARD).withSpan(wildcardSpan)
-      for case arg @ NamedArg(name: TermName, _) <- elems do
-        nameToIdx.get(name) match
-          case Some(idx) =>
-            if reordered(idx).isInstanceOf[Ident] then
-              reordered(idx) = arg
-            else
-              report.error(em"Duplicate named pattern", arg.srcPos)
-          case _ =>
-            report.error(em"No element named `$name` is defined in selector type $pt", arg.srcPos)
-      reordered.toList
+      inline def isCaseClass = pt.classSymbol.is(CaseClass) && !defn.isTupleClass(pt.classSymbol)
+      if !isCaseClass && !pt.isNamedTupleType then
+        report.error(NamedPatternNotApplicable(pt), pos)
+        Nil
+      else
+        var selNames = pt.namedTupleElementTypes(false).map(_(0))
+        if isCaseClass && selNames.isEmpty then
+          selNames = pt.classSymbol.caseAccessors.map(_.name.asTermName)
+        val nameToIdx = selNames.zipWithIndex.toMap
+        val reordered = Array.fill[untpd.Tree](selNames.length):
+          untpd.Ident(nme.WILDCARD).withSpan(wildcardSpan)
+        for case arg @ NamedArg(name: TermName, _) <- elems do
+          nameToIdx.get(name) match
+            case Some(idx) =>
+              if reordered(idx).isInstanceOf[Ident] then
+                reordered(idx) = arg
+              else
+                report.error(em"Duplicate named pattern", arg.srcPos)
+            case _ =>
+              report.error(em"No element named `$name` is defined in selector type $pt", arg.srcPos)
+        reordered.toList
+      end if
 
     elems match
       case (first @ NamedArg(_, _)) :: _ => reorderedNamedArgs(first.span.startPos)
@@ -2263,9 +2269,9 @@ object desugar {
               AppliedTypeTree(ref(defn.SeqType), t),
               New(ref(defn.RepeatedAnnot.typeRef), Nil :: Nil))
         else if op.name == nme.CC_REACH then
-          Apply(ref(defn.Caps_reachCapability), t :: Nil)
+          Annotated(t, New(ref(defn.ReachCapabilityAnnot.typeRef), Nil :: Nil))
         else if op.name == nme.CC_READONLY then
-          Apply(ref(defn.Caps_readOnlyCapability), t :: Nil)
+          Annotated(t, New(ref(defn.ReadOnlyCapabilityAnnot.typeRef), Nil :: Nil))
         else
           assert(ctx.mode.isExpr || ctx.reporter.errorsReported || ctx.mode.is(Mode.Interactive), ctx.mode)
           Select(t, op.name)
