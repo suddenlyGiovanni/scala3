@@ -2377,6 +2377,9 @@ object Parsers {
       val start = in.offset
       in.token match
         case IMPLICIT =>
+          report.errorOrMigrationWarning(
+            em"`implicit` lambdas are no longer supported, use a lambda with `?=>` instead",
+            in.sourcePos(), MigrationVersion.Scala2Implicits)
           closure(start, location, modifiers(BitSet(IMPLICIT)))
         case LBRACKET =>
           val start = in.offset
@@ -3291,7 +3294,7 @@ object Parsers {
           case nme.infix => Mod.Infix()
           case nme.tracked => Mod.Tracked()
           case nme.erased if in.erasedEnabled => Mod.Erased()
-          case nme.mut if Feature.ccEnabled => Mod.Mut()
+          case nme.update if Feature.ccEnabled => Mod.Update()
         }
     }
 
@@ -3557,7 +3560,17 @@ object Parsers {
 
       def paramMods() =
         if in.token == IMPLICIT then
-          addParamMod(() => Mod.Implicit())
+          report.errorOrMigrationWarning(
+            em"`implicit` parameters are no longer supported, use a `using` clause instead${rewriteNotice(`future-migration`)}",
+            in.sourcePos(), MigrationVersion.Scala2Implicits)
+          val startImplicit = in.offset
+          addParamMod(() =>
+            if ctx.settings.YimplicitToGiven.value then
+              patch(Span(in.lastOffset - 8, in.lastOffset), "using")
+            Mod.Implicit()
+          )
+          if MigrationVersion.Scala2Implicits.needsPatch then
+            patch(source, Span(startImplicit, in.lastOffset), "using")
         else if isIdent(nme.using) then
           if initialMods.is(Given) then
             syntaxError(em"`using` is already implied here, should not be given explicitly", in.offset)
@@ -4708,7 +4721,7 @@ object Parsers {
           Nil
         tree match
           case tree: MemberDef
-          if !(tree.mods.flags & ModifierFlags).isEmpty && !tree.mods.isMutableVar => // vars are OK, mut defs are not
+          if !(tree.mods.flags & ModifierFlags).isEmpty && !tree.mods.isMutableVar => // vars are OK, update defs are not
             fail(em"refinement cannot be ${(tree.mods.flags & ModifierFlags).flagStrings().mkString("`", "`, `", "`")}")
           case tree: DefDef if tree.termParamss.nestedExists(!_.rhs.isEmpty) =>
             fail(em"refinement cannot have default arguments")
@@ -4765,6 +4778,9 @@ object Parsers {
         else if (isExprIntro)
           stats += expr(Location.InBlock)
         else if in.token == IMPLICIT && !in.inModifierPosition() then
+          report.errorOrMigrationWarning(
+            em"`implicit` lambdas are no longer supported, use a lambda with `?=>` instead",
+            in.sourcePos(), MigrationVersion.Scala2Implicits)
           stats += closure(in.offset, Location.InBlock, modifiers(BitSet(IMPLICIT)))
         else if isIdent(nme.extension) && followingIsExtension() then
           stats += extension()

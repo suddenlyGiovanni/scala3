@@ -14,7 +14,7 @@ import printing.Highlighting.*
 import printing.Formatting
 import ErrorMessageID.*
 import ast.Trees
-import config.{Feature, ScalaVersion}
+import config.{Feature, MigrationVersion, ScalaVersion}
 import transform.patmat.Space
 import transform.patmat.SpaceEngine
 import typer.ErrorReporting.{err, matchReductionAddendum, substitutableTypeSymbolsInScope}
@@ -357,7 +357,7 @@ class TypeMismatch(val found: Type, expected: Type, val inTree: Option[untpd.Tre
     ++ addenda.dropWhile(_.isEmpty).headOption.getOrElse(importSuggestions)
 
   override def explain(using Context) =
-    val treeStr = inTree.map(x => s"\nTree: ${x.show}").getOrElse("")
+    val treeStr = inTree.map(x => s"\nTree:\n\n${x.show}\n").getOrElse("")
     treeStr + "\n" + super.explain
 
 end TypeMismatch
@@ -542,7 +542,6 @@ extends SyntaxMsg(RepeatedModifierID) {
   }
 
   override def actions(using Context) =
-    import scala.language.unsafeNulls
     List(
       CodeAction(title = s"""Remove repeated modifier: "$modifier"""",
         description = None,
@@ -887,7 +886,6 @@ extends Message(PatternMatchExhaustivityID) {
         |"""
 
   override def actions(using Context) =
-    import scala.language.unsafeNulls
     val endPos = tree.cases.lastOption.map(_.endPos)
       .getOrElse(tree.selector.endPos)
     val startColumn = tree.cases.lastOption
@@ -910,7 +908,6 @@ extends Message(PatternMatchExhaustivityID) {
 
 
   private def indent(text:String, margin: Int): String = {
-    import scala.language.unsafeNulls
     " " * margin + text
   }
 }
@@ -1595,6 +1592,14 @@ class MissingArgument(pname: Name, methString: String)(using Context)
     else s"missing argument for parameter $pname of $methString"
   def explain(using Context) = ""
 
+class MissingImplicitParameterInEmptyArguments(pname: Name, methString: String)(using Context)
+  extends MissingArgument(pname, methString):
+  override def msg(using Context) =
+    val mv = MigrationVersion.ImplicitParamsWithoutUsing
+    super.msg.concat(Message.rewriteNotice("This code", mv.patchFrom)) // patch emitted up the stack
+  override def explain(using Context) =
+    "Old-style implicit argument lists may be omitted but not empty; this syntax was corrected in 3.7."
+
 class MissingArgumentList(method: String, sym: Symbol)(using Context)
   extends TypeMsg(MissingArgumentListID) {
   def msg(using Context) =
@@ -1991,7 +1996,6 @@ class OnlyFunctionsCanBeFollowedByUnderscore(tp: Type, tree: untpd.PostfixOp)(us
         |To convert to a function value, you need to explicitly write ${hl("() => x")}"""
 
   override def actions(using Context) =
-    import scala.language.unsafeNulls
     val untpd.PostfixOp(qual, Ident(nme.WILDCARD)) = tree: @unchecked
     List(
       CodeAction(title = "Rewrite to function value",
@@ -2021,7 +2025,6 @@ class MissingEmptyArgumentList(method: String, tree: tpd.Tree)(using Context)
   }
 
   override def actions(using Context) =
-    import scala.language.unsafeNulls
     List(
       CodeAction(title = "Insert ()",
         description = None,
@@ -2336,12 +2339,16 @@ class SymbolIsNotAValue(symbol: Symbol)(using Context) extends TypeMsg(SymbolIsN
 
 class DoubleDefinition(decl: Symbol, previousDecl: Symbol, base: Symbol)(using Context)
 extends NamingMsg(DoubleDefinitionID) {
+  import Signature.MatchDegree.*
+
+  private def erasedType: Type =
+    if ctx.erasedTypes then decl.info
+    else TypeErasure.transformInfo(decl, decl.info)
+
   def msg(using Context) = {
     def nameAnd = if (decl.name != previousDecl.name) " name and" else ""
-    def erasedType = if ctx.erasedTypes then i" ${decl.info}" else ""
     def details(using Context): String =
       if (decl.isRealMethod && previousDecl.isRealMethod) {
-        import Signature.MatchDegree.*
 
         // compare the signatures when both symbols represent methods
         decl.signature.matchDegree(previousDecl.signature) match {
@@ -2366,7 +2373,7 @@ extends NamingMsg(DoubleDefinitionID) {
                     |Consider adding a @targetName annotation to one of the conflicting definitions
                     |for disambiguation."""
               else ""
-            i"have the same$nameAnd type$erasedType after erasure.$hint"
+            i"have the same$nameAnd type $erasedType after erasure.$hint"
         }
       }
       else ""
@@ -2379,7 +2386,7 @@ extends NamingMsg(DoubleDefinitionID) {
     }
     val clashDescription =
       if (decl.owner eq previousDecl.owner)
-        "Double definition"
+        "Conflicting definitions"
       else if ((decl.owner eq base) || (previousDecl eq base))
         "Name clash between defined and inherited member"
       else
@@ -2392,7 +2399,43 @@ extends NamingMsg(DoubleDefinitionID) {
           |"""
     } + details
   }
-  def explain(using Context) = ""
+  def explain(using Context) =
+    decl.signature.matchDegree(previousDecl.signature) match
+      case FullMatch =>
+       i"""
+        |As part of the Scala compilation pipeline every type is reduced to its erased
+        |(runtime) form. In this phase, among other transformations, generic parameters
+        |disappear and separate parameter-list boundaries are flattened.
+        |
+        |For example, both `f[T](x: T)(y: String): Unit` and `f(x: Any, z: String): Unit`
+        |erase to the same runtime signature `f(x: Object, y: String): Unit`. Note that
+        |parameter names are irrelevant.
+        |
+        |In your code the two declarations
+        |
+        |  ${previousDecl.showDcl}
+        |  ${decl.showDcl}
+        |
+        |erase to the identical signature
+        |
+        |  ${erasedType}
+        |
+        |so the compiler cannot keep both: the generated bytecode symbols would collide.
+        |
+        |To fix this error, you need to disambiguate the two definitions. You can either:
+        |
+        |1. Rename one of the definitions, or
+        |2. Keep the same names in source but give one definition a distinct
+        |   bytecode-level name via `@targetName` for example:
+        |
+        |      @targetName("${decl.name.show}_2")
+        |      ${decl.showDcl}
+        |
+        |Choose the `@targetName` argument carefully: it is the name that will be used
+        |when calling the method externally, so it should be unique and descriptive.
+        """
+      case _ => ""
+
 }
 
 class ImportedTwice(sel: Name)(using Context) extends SyntaxMsg(ImportedTwiceID) {
@@ -3277,7 +3320,7 @@ extends SyntaxMsg(VolatileOnValID):
   protected def explain(using Context): String = ""
 
 class ConstructorProxyNotValue(sym: Symbol)(using Context)
-extends TypeMsg(ConstructorProxyNotValueID):
+extends TypeMsg(PhantomSymbolNotValueID):
   protected def msg(using Context): String =
     i"constructor proxy $sym cannot be used as a value"
   protected def explain(using Context): String =
@@ -3292,7 +3335,7 @@ extends TypeMsg(ConstructorProxyNotValueID):
        |but not as a stand-alone value."""
 
 class ContextBoundCompanionNotValue(sym: Symbol)(using Context)
-extends TypeMsg(ConstructorProxyNotValueID):
+extends TypeMsg(PhantomSymbolNotValueID):
   protected def msg(using Context): String =
     i"context bound companion $sym cannot be used as a value"
   protected def explain(using Context): String =
@@ -3310,6 +3353,22 @@ extends TypeMsg(ConstructorProxyNotValueID):
        |the selection `A.unit`, which works because the compiler created a context bound
        |companion value with the (term-)name `A`. However, these context bound companions
        |are not values themselves, they can only be referred to in selections."""
+
+class DummyCaptureParamNotValue(sym: Symbol)(using Context)
+extends TypeMsg(PhantomSymbolNotValueID):
+  protected def msg(using Context): String =
+    i"dummy term capture parameter $sym cannot be used as a value"
+  protected def explain(using Context): String =
+    i"""A term capture parameter is a symbol made up by the compiler to represent a reference
+       |to a real capture parameter in capture sets. For instance, in
+       |
+       |   class A:
+       |     type C^
+       |
+       |there is just a type `A` declared but not a value `A`. Nevertheless, one can write
+       |the selection `(a: A).C` and use a a value, which works because the compiler created a
+       |term capture parameter for `C`. However, these term capture parameters are not real values,
+       |they can only be referred in capture sets."""
 
 class UnusedSymbol(errorText: String, val actions: List[CodeAction] = Nil)(using Context)
 extends Message(UnusedSymbolID):
@@ -3518,9 +3577,34 @@ final class OnlyFullyDependentAppliedConstructorType()(using Context)
   override protected def explain(using Context): String = ""
 
 final class IllegalContextBounds(using Context) extends SyntaxMsg(IllegalContextBoundsID):
-  override protected def msg(using Context): String = 
+  override protected def msg(using Context): String =
     i"Context bounds are not allowed in this position"
 
   override protected def explain(using Context): String = ""
 
-end IllegalContextBounds
+final class NamedPatternNotApplicable(selectorType: Type)(using Context) extends PatternMatchMsg(NamedPatternNotApplicableID):
+  override protected def msg(using Context): String =
+    i"Named patterns cannot be used with $selectorType, because it is not a named tuple or case class"
+
+  override protected def explain(using Context): String = ""
+
+/**  @param reason            The reason for the unnecessary null. The warning given to the user will be i""""Unncessary .nn: $reason"""
+   *  @param sourcePosition   The sourcePosition of the qualifier
+   */
+class UnnecessaryNN(reason: String, sourcePosition: SourcePosition)(using Context) extends SyntaxMsg(UnnecessaryNN) {
+  override def msg(using Context) = i"""Unnecessary .nn: $reason"""
+
+  override def explain(using Context) = ""
+
+  private val nnSourcePosition = SourcePosition(sourcePosition.source, Span(sourcePosition.span.end, sourcePosition.span.end + 3, sourcePosition.span.end), sourcePosition.outer)
+
+  override def actions(using Context) =
+    List(
+      CodeAction(title = """Remove unnecessary .nn""",
+        description = None,
+        patches = List(
+          ActionPatch(nnSourcePosition, "")
+        )
+      )
+    )
+}

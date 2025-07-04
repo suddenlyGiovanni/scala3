@@ -21,7 +21,7 @@ import annotation.constructorOnly
 import ast.tpd
 import printing.{Printer, Showable}
 import printing.Texts.Text
-import reporting.Message
+import reporting.{Message, trace}
 import NameOps.isImpureFunction
 import annotation.internal.sharable
 
@@ -330,6 +330,12 @@ object Capabilities:
     final def isExclusive(using Context): Boolean =
       !isReadOnly && (isTerminalCapability || captureSetOfInfo.isExclusive)
 
+    /** Similar to isExlusive, but also includes capabilties with capture
+     *  set variables in their info whose status is still open.
+     */
+    final def maybeExclusive(using Context): Boolean =
+      !isReadOnly && (isTerminalCapability || captureSetOfInfo.maybeExclusive)
+
     final def isWellformed(using Context): Boolean = this match
       case self: CoreCapability => self.isTrackableRef
       case _ => true
@@ -375,15 +381,18 @@ object Capabilities:
       case tp1: FreshCap => tp1.ccOwner
       case _ => NoSymbol
 
-    final def isParamPath(using Context): Boolean = this match
+    final def paramPathRoot(using Context): Type = core match
       case tp1: NamedType =>
         tp1.prefix match
           case _: ThisType | NoPrefix =>
-            tp1.symbol.is(Param) || tp1.symbol.is(ParamAccessor)
-          case prefix: CoreCapability => prefix.isParamPath
-          case _ => false
-      case _: ParamRef => true
-      case _ => false
+            if tp1.symbol.is(Param) || tp1.symbol.is(ParamAccessor) then tp1
+            else NoType
+          case prefix: CoreCapability => prefix.paramPathRoot
+          case _ => NoType
+      case tp1: ParamRef => tp1
+      case _ => NoType
+
+    final def isParamPath(using Context): Boolean = paramPathRoot.exists
 
     final def ccOwner(using Context): Symbol = this match
       case self: ThisType => self.cls
@@ -603,6 +612,21 @@ object Capabilities:
     def assumedContainsOf(x: TypeRef)(using Context): SimpleIdentitySet[Capability] =
       CaptureSet.assumedContains.getOrElse(x, SimpleIdentitySet.empty)
 
+    /** The type representing this capability.
+     *  Note this method does not distinguish different `RootCapability` instances,
+     *  and should only be used for printing or phases not related to CC.
+     */
+    def toType(using Context): Type = this match
+      case c: RootCapability => defn.captureRoot.termRef
+      case c: CoreCapability => c
+      case c: DerivedCapability =>
+        val c1 = c.underlying.toType
+        c match
+          case _: ReadOnly => ReadOnlyCapability(c1)
+          case _: Reach => ReachCapability(c1)
+          case _: Maybe => MaybeCapability(c1)
+          case _ => c1
+
     def toText(printer: Printer): Text = printer.toTextCapability(this)
   end Capability
 
@@ -669,7 +693,7 @@ object Capabilities:
     thisMap =>
 
     override def apply(t: Type) =
-      if variance <= 0 then t
+      if variance < 0 then t
       else t match
         case t @ CapturingType(_, _) =>
           mapOver(t)
@@ -679,6 +703,8 @@ object Capabilities:
             this(CapturingType(parent1, ann.tree.toCaptureSet))
           else
             t.derivedAnnotatedType(parent1, ann)
+        case defn.RefinedFunctionOf(_) =>
+          t  // stop at dependent function types
         case _ =>
           mapFollowingAliases(t)
 
@@ -760,7 +786,7 @@ object Capabilities:
     abstract class CapMap extends BiTypeMap:
       override def mapOver(t: Type): Type = t match
         case t @ FunctionOrMethod(args, res) if variance > 0 && !t.isAliasFun =>
-          t // `t` should be mapped in this case by a different call to `mapCap`.
+          t // `t` should be mapped in this case by a different call to `toResult`. See [[toResultInResults]].
         case t: (LazyRef | TypeVar) =>
           mapConserveSuper(t)
         case _ =>
@@ -825,7 +851,8 @@ object Capabilities:
   end toResult
 
   /** Map global roots in function results to result roots. Also,
-   *  map roots in the types of parameterless def methods.
+   *  map roots in the types of def methods that are parameterless
+   *  or have only type parameters.
    */
   def toResultInResults(sym: Symbol, fail: Message => Unit, keepAliases: Boolean = false)(tp: Type)(using Context): Type =
     val m = new TypeMap with FollowAliasesMap:
@@ -854,7 +881,18 @@ object Capabilities:
             throw ex
     m(tp) match
       case tp1: ExprType if sym.is(Method, butNot = Accessor) =>
+        // Map the result of parameterless `def` methods.
         tp1.derivedExprType(toResult(tp1.resType, tp1, fail))
+      case tp1: PolyType if !tp1.resType.isInstanceOf[MethodicType] =>
+        // Map also the result type of method with only type parameters.
+        // This way, the `^` in the following method will be mapped to a `ResultCap`:
+        // ```
+        // object Buffer:
+        //   def empty[T]: Buffer[T]^
+        // ```
+        // This is more desirable than interpreting `^` as a `Fresh` at the level of `Buffer.empty`
+        // in most cases.
+        tp1.derivedLambdaType(resType = toResult(tp1.resType, tp1, fail))
       case tp1 => tp1
   end toResultInResults
 

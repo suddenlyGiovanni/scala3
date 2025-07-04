@@ -172,9 +172,7 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
   override def prepareForValDef(tree: ValDef)(using Context): Context =
     if !tree.symbol.is(Deferred) && tree.rhs.symbol != defn.Predef_undefined then
       refInfos.register(tree)
-    tree.tpt match
-    case RefinedTypeTree(_, refinements) => relax(tree.rhs, refinements)
-    case _ =>
+    relax(tree.rhs, tree.tpt.tpe)
     ctx
   override def transformValDef(tree: ValDef)(using Context): tree.type =
     traverseAnnotations(tree.symbol)
@@ -198,9 +196,7 @@ class CheckUnused private (phaseMode: PhaseMode, suffix: String) extends MiniPha
       refInfos.inliners += 1
     else if !tree.symbol.is(Deferred) && tree.rhs.symbol != defn.Predef_undefined then
       refInfos.register(tree)
-    tree.tpt match
-    case RefinedTypeTree(_, refinements) => relax(tree.rhs, refinements)
-    case _ =>
+    relax(tree.rhs, tree.tpt.tpe)
     ctx
   override def transformDefDef(tree: DefDef)(using Context): tree.type =
     traverseAnnotations(tree.symbol)
@@ -534,12 +530,15 @@ object CheckUnused:
         // A class param is unused if its param accessor is unused.
         // (The class param is not assigned to a field until constructors.)
         // A local param accessor warns as a param; a private accessor as a private member.
-        // Avoid warning for case class elements because they are aliased via unapply.
+        // Avoid warning for case class elements because they are aliased via unapply (i.e. may be extracted).
         if m.isPrimaryConstructor then
           val alias = m.owner.info.member(sym.name)
           if alias.exists then
             val aliasSym = alias.symbol
-            if aliasSym.isAllOf(PrivateParamAccessor, butNot = CaseAccessor) && !infos.refs(alias.symbol) then
+            if aliasSym.isAllOf(PrivateParamAccessor, butNot = CaseAccessor)
+              && !infos.refs(alias.symbol)
+              && !usedByDefaultGetter(sym, m)
+            then
               if aliasSym.is(Local) then
                 if ctx.settings.WunusedHas.explicits then
                   warnAt(pos)(UnusedSymbol.explicitParams(aliasSym))
@@ -548,13 +547,14 @@ object CheckUnused:
                   warnAt(pos)(UnusedSymbol.privateMembers)
         else if ctx.settings.WunusedHas.explicits
           && !sym.is(Synthetic) // param to setter is unused bc there is no field yet
-          && !(sym.owner.is(ExtensionMethod) && {
-            m.paramSymss.dropWhile(_.exists(_.isTypeParam)) match
-            case (h :: Nil) :: Nil => h == sym // param is the extended receiver
+          && !(sym.owner.is(ExtensionMethod) &&
+            m.paramSymss.dropWhile(_.exists(_.isTypeParam)).match
+            case (h :: Nil) :: _ => h == sym // param is the extended receiver
             case _ => false
-          })
+          )
           && !sym.name.isInstanceOf[DerivedName]
           && !ctx.platform.isMainMethod(m)
+          && !usedByDefaultGetter(sym, m)
         then
           warnAt(pos)(UnusedSymbol.explicitParams(sym))
       end checkExplicit
@@ -565,6 +565,16 @@ object CheckUnused:
       then
         checkExplicit()
     end checkParam
+
+    // does the param have an alias in a default arg method that is used?
+    def usedByDefaultGetter(param: Symbol, meth: Symbol): Boolean =
+      val cls = if meth.isConstructor then meth.enclosingClass.companionModule else meth.enclosingClass
+      val MethName = meth.name
+      cls.info.decls.exists: d =>
+        d.name match
+        case DefaultGetterName(MethName, _) =>
+          d.paramSymss.exists(_.exists(p => p.name == param.name && infos.refs(p)))
+        case _ => false
 
     def checkImplicit(sym: Symbol, pos: SrcPos) =
       val m = sym.owner
@@ -595,9 +605,12 @@ object CheckUnused:
             val checking =
                  aliasSym.isAllOf(PrivateParamAccessor, butNot = CaseAccessor)
               || aliasSym.isAllOf(Protected | ParamAccessor, butNot = CaseAccessor) && m.owner.is(Given)
-            if checking && !infos.refs(alias.symbol) then
+            if checking
+              && !infos.refs(alias.symbol)
+              && !usedByDefaultGetter(sym, m)
+            then
               warnAt(pos)(UnusedSymbol.implicitParams(aliasSym))
-        else
+        else if !usedByDefaultGetter(sym, m) then
           warnAt(pos)(UnusedSymbol.implicitParams(sym))
 
     def checkLocal(sym: Symbol, pos: SrcPos) =
@@ -864,15 +877,21 @@ object CheckUnused:
       case tree => traverseChildren(tree)
 
   // NoWarn members in tree that correspond to refinements; currently uses only names.
-  def relax(tree: Tree, refinements: List[Tree])(using Context): Unit =
-    val names = refinements.collect { case named: NamedDefTree => named.name }.toSet
-    val relaxer = new TreeTraverser:
-      def traverse(tree: Tree)(using Context) =
-        tree match
-        case tree: NamedDefTree if names(tree.name) => tree.withAttachment(NoWarn, ())
-        case _ =>
-        traverseChildren(tree)
-    relaxer.traverse(tree)
+  def relax(tree: Tree, tpe: Type)(using Context): Unit =
+    def refinements(tpe: Type, names: List[Name]): List[Name] =
+      tpe match
+      case RefinedType(parent, refinedName, refinedInfo) => refinedName :: refinements(parent, names)
+      case _ => names
+    val refinedNames = refinements(tpe, Nil)
+    if !refinedNames.isEmpty then
+      val names = refinedNames.toSet
+      val relaxer = new TreeTraverser:
+        def traverse(tree: Tree)(using Context) =
+          tree match
+          case tree: NamedDefTree if names(tree.name) => tree.withAttachment(NoWarn, ())
+          case _ =>
+          traverseChildren(tree)
+      relaxer.traverse(tree)
 
   extension (nm: Name)
     inline def exists(p: Name => Boolean): Boolean = nm.ne(nme.NO_NAME) && p(nm)
